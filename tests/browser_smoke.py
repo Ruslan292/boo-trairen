@@ -81,6 +81,165 @@ def question_signature(question):
     return normalized(question["text"]), tuple(normalized(option["text"]) for option in question["options"])
 
 
+def progress_fixture(answers, session=None, ticket_id=1):
+    return {
+        "version": 3, "selectedMode": "learn", "mistakes": [], "exams": [],
+        "modes": {
+            "learn": {"answers": answers, "session": session, "settings": {"ticketId": ticket_id}},
+            "exam": {"answers": {}, "session": None, "settings": {"ticketId": 0, "minutes": 10, "allowedErrors": 1}},
+            "mistakes": {"answers": {}, "session": None, "settings": {"ticketId": 0}},
+        },
+    }
+
+
+def seed_fixture(browser, base_url, errors, value):
+    context = browser.new_context(viewport={"width": 1440, "height": 1080})
+    page = context.new_page()
+    monitor(page, errors)
+    page.goto(base_url)
+    wait_home(page)
+    page.evaluate("({key, value}) => localStorage.setItem(key, JSON.stringify(value))", {"key": STORAGE_KEY, "value": value})
+    page.reload()
+    wait_home(page)
+    return context, page
+
+
+def completed_ticket_continuation_flow(browser, base_url, errors):
+    completed = 60
+    answers = {question["id"]: {"attempts": 1, "correct": 1} for question in ALL_QUESTIONS[:completed]}
+    for case in ("no_session", "finished", "all_checked", "old_implicit_repeat", "old_allbank_unchecked"):
+        session = None
+        if case != "no_session":
+            bank = ALL_QUESTIONS if case == "old_allbank_unchecked" else FIRST_TICKET["questions"]
+            checked = case in ("finished", "all_checked")
+            session = {
+                "mode": "learn", "ticketId": None if case == "old_allbank_unchecked" else FIRST_TICKET["id"],
+                "questionIds": [question["id"] for question in bank], "index": len(bank) - 1 if checked else 0,
+                "responses": {question["id"]: question["correctOptionId"] for question in bank} if checked else {},
+                "checked": [question["id"] for question in bank] if checked else [],
+                "startedAt": 1700000000000, "deadline": None, "allowedErrors": 1,
+                "status": "finished" if case == "finished" else "active", "bankVersion": 2,
+            }
+            if case == "finished":
+                session["finishedAt"] = 1700000600000
+        context, page = seed_fixture(browser, base_url, errors, progress_fixture(answers, session))
+        expect(action(page, "start")).to_contain_text("Продолжить обучение")
+        expect(page.locator(".stat-card").nth(0)).to_contain_text(f"{completed} / {len(ALL_QUESTIONS)}")
+        expect(action(page, "resume", '[data-mode="learn"]')).to_have_count(1 if case == "old_allbank_unchecked" else 0)
+        before = stored(page)
+        if case == "no_session":
+            page.screenshot(path="/tmp/boo-continue-ticket1-fixed.png", full_page=True)
+            for width in (320, 390):
+                page.set_viewport_size({"width": width, "height": 844})
+                no_overflow(page, f"completed-ticket continuation home {width}px")
+            page.screenshot(path="/tmp/boo-continue-fixed-mobile.png", full_page=True)
+            navigate(page, "tickets")
+            expect(action(page, "continue-learn")).to_be_visible()
+            for width in (320, 390):
+                page.set_viewport_size({"width": width, "height": 844})
+                no_overflow(page, f"tickets continuation toolbar {width}px")
+            navigate(page, "home")
+            page.set_viewport_size({"width": 1440, "height": 1080})
+        action(page, "start").click()
+        expect(page.locator("dialog[open], .feedback")).to_have_count(0)
+        expect(page.locator(".question-text")).to_have_text(ALL_QUESTIONS[completed]["text"])
+        learning = stored(page, "learn")
+        assert learning["answers"] == answers, f"Continuation must preserve all attempts: {case}"
+        assert learning["session"]["questionIds"] == [question["id"] for question in ALL_QUESTIONS[completed:]], case
+        assert learning["session"]["index"] == 0
+        assert not learning["session"].get("repeat", False)
+        assert stored(page, "exam") == before["modes"]["exam"]
+        assert stored(page, "mistakes") == before["modes"]["mistakes"]
+        if case == "old_allbank_unchecked":
+            assert learning["session"]["startedAt"] == session["startedAt"]
+        snapshot = stored(page)
+        page.reload()
+        wait_home(page)
+        resume(page, "learn")
+        expect(page.locator(".question-text")).to_have_text(ALL_QUESTIONS[completed]["text"])
+        assert stored(page) == snapshot, f"Continuation reload must not restart or grade again: {case}"
+        context.close()
+    print("PASS completed-ticket continuation preserves 60 answers for absent/finished/checked/implicit-repeat sessions")
+
+
+def partial_ticket_continuation_flow(browser, base_url, errors):
+    first_completed = FIRST_TICKET_SIZE // 2
+    studied = FIRST_TICKET["questions"][:first_completed] + ALL_QUESTIONS[FIRST_TICKET_SIZE:FIRST_TICKET_SIZE + 60 - first_completed]
+    answers = {question["id"]: {"attempts": 1, "correct": 1} for question in studied}
+    pending = FIRST_TICKET["questions"][first_completed:]
+    context, page = seed_fixture(browser, base_url, errors, progress_fixture(answers))
+    navigate(page, "tickets")
+    expect(action(page, "ticket-learn", f'[data-ticket="{FIRST_TICKET_ID}"]')).to_contain_text("Продолжить билет")
+    action(page, "ticket-learn", f'[data-ticket="{FIRST_TICKET_ID}"]').click()
+    expect(page.locator("dialog[open]")).to_have_count(0)
+    expect(page.locator(".question-text")).to_have_text(pending[0]["text"])
+    assert stored(page, "learn")["session"]["questionIds"] == [question["id"] for question in pending]
+    assert stored(page, "learn")["answers"] == answers
+    choose_answer(page, pending[0])
+    action(page, "check").click()
+    action(page, "next").click()
+    learning = stored(page, "learn")
+    for reload in (False, True):
+        if reload:
+            page.reload()
+            wait_home(page)
+        navigate(page, "tickets")
+        action(page, "ticket-learn", f'[data-ticket="{FIRST_TICKET_ID}"]').click()
+        expect(page.locator("dialog[open]")).to_have_count(0)
+        expect(page.locator(".question-text")).to_have_text(pending[1]["text"])
+        assert stored(page, "learn") == learning, "Same-ticket continuation must preserve position and counters"
+    for question in pending[1:]:
+        choose_answer(page, question)
+        action(page, "check").click()
+        action(page, "next").click()
+    expect(page.locator(".results h1")).to_be_visible()
+    expect(page.locator(".result-stats > div").nth(0)).to_contain_text(f"{len(pending)} / {len(pending)}")
+    after = stored(page, "learn")["answers"]
+    assert len(after) == 60 + len(pending)
+    action(page, "continue-learn").click()
+    expect(page.locator("dialog[open]")).to_have_count(0)
+    expect(page.locator(".question-text")).to_have_text(ALL_QUESTIONS[60 + len(pending)]["text"])
+    assert stored(page, "learn")["answers"] == after
+    assert all(question_id not in after for question_id in stored(page, "learn")["session"]["questionIds"])
+    print("PASS partial ticket continues only pending questions, resumes without regrading, and results continue study")
+    context.close()
+
+
+def explicit_repeat_flow(browser, base_url, errors):
+    answers = {question["id"]: {"attempts": 1, "correct": 1} for question in ALL_QUESTIONS[:60]}
+    for continuation in ("continue-learn", "quick-learn"):
+        context, page = seed_fixture(browser, base_url, errors, progress_fixture(answers))
+        navigate(page, "tickets")
+        expect(action(page, "ticket-repeat", f'[data-ticket="{FIRST_TICKET_ID}"]')).to_contain_text("Повторить билет")
+        action(page, "ticket-repeat", f'[data-ticket="{FIRST_TICKET_ID}"]').click()
+        expect(page.locator(".question-text")).to_have_text(FIRST["text"])
+        assert stored(page, "learn")["session"].get("repeat") is True
+        choose_answer(page, FIRST)
+        repeat = stored(page, "learn")
+        page.reload()
+        wait_home(page)
+        expect(action(page, "start")).to_contain_text("Продолжить повтор")
+        action(page, "start").click()
+        expect(page.locator(".question-text")).to_have_text(FIRST["text"])
+        expect(page.locator(f'.answer.chosen[data-option="{FIRST["correctOptionId"]}"]')).to_be_visible()
+        assert stored(page, "learn") == repeat
+        action(page, "check").click()
+        action(page, "next").click()
+        expect(page.locator(".question-text")).to_have_text(SECOND["text"])
+        after_repeat = stored(page, "learn")["answers"]
+        assert len(after_repeat) == 60
+        assert after_repeat[FIRST["id"]] == {"attempts": 2, "correct": 2}
+        navigate(page, "home")
+        action(page, continuation).click()
+        expect(page.locator("dialog[open]")).to_have_count(0)
+        expect(page.locator(".question-text")).to_have_text(ALL_QUESTIONS[60]["text"])
+        assert not stored(page, "learn")["session"].get("repeat", False)
+        assert stored(page, "learn")["session"]["questionIds"] == [question["id"] for question in ALL_QUESTIONS[60:]]
+        assert stored(page, "learn")["answers"] == after_repeat
+        context.close()
+    print("PASS explicit repeat persists across reload and both study controls return to pending questions")
+
+
 def deduplicated_learning_flow(browser, base_url, errors):
     context = browser.new_context()
     page = context.new_page()
@@ -283,6 +442,7 @@ def legacy_active_learning_flow(browser, base_url, errors):
     expect(page.locator(".question-text")).to_have_text(ALL_QUESTIONS[completed]["text"])
     expect(page.locator(".exercise-top")).to_contain_text(f"Вопрос {completed + 1} из {len(ALL_QUESTIONS)}")
     assert len(stored(page, "learn")["session"]["questionIds"]) == len(ALL_QUESTIONS)
+    assert not stored(page, "learn")["session"].get("repeat", False)
     choose_answer(page, ALL_QUESTIONS[completed])
     action(page, "check").click()
     action(page, "next").click()
@@ -471,6 +631,7 @@ def independent_modes_flow(browser, base_url, errors):
     action(page, "confirm-finish").click()
     expect(page.locator(".question-text")).to_have_text(FIRST["text"])
     assert len(stored(page, "learn")["session"]["questionIds"]) == len(ALL_QUESTIONS)
+    assert stored(page, "learn")["session"].get("repeat") is True
     assert stored(page, "learn")["answers"] == learning["answers"]
     assert stored(page, "exam") == unchanged_exam
     assert stored(page, "mistakes") == review
@@ -676,6 +837,9 @@ def main():
         migration_flow(browser, args.base_url, errors)
         legacy_active_learning_flow(browser, args.base_url, errors)
         independent_modes_flow(browser, args.base_url, errors)
+        completed_ticket_continuation_flow(browser, args.base_url, errors)
+        partial_ticket_continuation_flow(browser, args.base_url, errors)
+        explicit_repeat_flow(browser, args.base_url, errors)
         browser.close()
         assert not errors, f"Browser errors: {errors}"
     print("Browser smoke passed; screenshots: /tmp/boo-desktop.png, /tmp/boo-mobile.png")

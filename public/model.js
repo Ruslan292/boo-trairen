@@ -110,7 +110,31 @@ export function createSession(tickets, mode, settings, progress, now = Date.now(
     responses: {}, checked: [], startedAt: now,
     deadline: mode === 'exam' ? now + Number(settings.minutes || 10) * 60_000 : null,
     allowedErrors: Number(settings.allowedErrors ?? 1), status: 'active', bankVersion: 2,
+    ...(mode === 'learn' && settings.repeat === true ? { repeat: true } : {}),
   };
+}
+
+export function learningContinuation(tickets, progress, ticketId = 0, now = Date.now()) {
+  const session = progress.modes.learn.session;
+  const checked = new Set(session?.checked || []);
+  if (session?.status === 'active') {
+    const unchecked = session.questionIds.filter(id => !checked.has(id));
+    if (session.repeat === true && unchecked.length) return session;
+    const answers = progress.modes.learn.answers;
+    const pendingId = unchecked.find(id => !answers[id]);
+    if (pendingId) {
+      const currentId = session.questionIds[session.index];
+      const questionIds = session.questionIds.filter(id => checked.has(id) || !answers[id]);
+      if (questionIds.length !== session.questionIds.length) {
+        const currentIndex = questionIds.indexOf(currentId);
+        return { ...session, questionIds, index: currentIndex >= 0 ? currentIndex : questionIds.indexOf(pendingId) };
+      }
+      return session;
+    }
+  }
+  const selected = createSession(tickets, 'learn', { ticketId, remainingOnly: true }, progress, now);
+  if (selected || !ticketId) return selected;
+  return createSession(tickets, 'learn', { ticketId: 0, remainingOnly: true }, progress, now);
 }
 
 export function recordAnswer(progress, question, optionId, mode = 'learn') {

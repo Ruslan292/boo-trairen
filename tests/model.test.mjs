@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { emptyProgress, questionMap, restoreProgress, createSession, recordAnswer, finishSession, resultFor, statsFor } from '../public/model.js';
+import { emptyProgress, questionMap, restoreProgress, createSession, learningContinuation, recordAnswer, finishSession, resultFor, statsFor } from '../public/model.js';
 
 const data = JSON.parse(await readFile(new URL('../public/questions.json', import.meta.url), 'utf8'));
 const map = questionMap(data.tickets);
@@ -389,4 +389,143 @@ test('corrupt mode state falls back independently and empty progress shares no o
   recordAnswer(fresh, first, first.correctOptionId, 'learn');
   assert.deepEqual(fresh.modes.exam.answers, {});
   assert.deepEqual(emptyProgress().modes.learn.answers, {});
+});
+
+test('continuation falls back from a completed selected ticket to the remaining 56 questions', () => {
+  const questions = [...map.values()];
+  for (const previousSession of ['none', 'finished', 'active-all-checked']) {
+    const progress = emptyProgress();
+    for (const question of questions.slice(0, 60)) recordAnswer(progress, question, question.correctOptionId);
+    progress.modes.learn.settings.ticketId = 1;
+    if (previousSession !== 'none') {
+      const session = createSession(data.tickets, 'learn', { ticketId: 1 }, progress, 1000);
+      session.responses = Object.fromEntries(data.tickets[0].questions.map(question => [question.id, question.correctOptionId]));
+      session.checked = [...session.questionIds];
+      session.index = session.questionIds.length - 1;
+      if (previousSession === 'finished') session.status = 'finished';
+      progress.modes.learn.session = session;
+    }
+    progress.modes.exam.session = createSession(data.tickets, 'exam', options, progress, 500);
+    progress.mistakes = [questions[70].id];
+    progress.modes.mistakes.session = createSession(data.tickets, 'mistakes', {}, progress, 500);
+    const before = structuredClone(progress);
+    const continuation = learningContinuation(data.tickets, progress, progress.modes.learn.settings.ticketId, 2000);
+    assert.deepEqual(continuation.questionIds, questions.slice(60).map(question => question.id));
+    assert.equal(continuation.questionIds.length, 56);
+    assert.equal(continuation.questionIds[0], questions[60].id);
+    assert.equal(continuation.index, 0);
+    assert.equal(continuation.startedAt, 2000);
+    assert.equal(continuation.ticketId, null);
+    assert.notEqual(continuation, progress.modes.learn.session);
+    assert.deepEqual(progress, before);
+  }
+});
+
+test('continuation prefers the unstudied part of a partially completed selected ticket', () => {
+  const progress = emptyProgress();
+  const ticket = data.tickets[2];
+  for (const question of ticket.questions.slice(0, 4)) recordAnswer(progress, question, question.correctOptionId);
+  const before = structuredClone(progress);
+  const continuation = learningContinuation(data.tickets, progress, ticket.id, 2000);
+  assert.equal(continuation.ticketId, ticket.id);
+  assert.deepEqual(continuation.questionIds, ticket.questions.slice(4).map(question => question.id));
+  assert.equal(continuation.questionIds.length, 6);
+  assert.deepEqual(progress, before);
+});
+
+test('continuation preserves the active session identity, 61st position and unchecked selection', () => {
+  const progress = emptyProgress();
+  const questions = [...map.values()];
+  const session = createSession(data.tickets, 'learn', {}, progress, 1000);
+  for (const question of questions.slice(0, 60)) {
+    recordAnswer(progress, question, question.correctOptionId);
+    session.responses[question.id] = question.correctOptionId;
+    session.checked.push(question.id);
+  }
+  session.index = 60;
+  session.responses[questions[60].id] = questions[60].options[0].id;
+  progress.modes.learn.session = session;
+  const before = structuredClone(progress);
+  assert.equal(learningContinuation(data.tickets, progress, 1, 2000), session);
+  assert.equal(session.index, 60);
+  assert.equal(session.responses[questions[60].id], questions[60].options[0].id);
+  assert.deepEqual(progress, before);
+  session.index = 59;
+  const feedbackBefore = structuredClone(progress);
+  assert.equal(learningContinuation(data.tickets, progress, 1, 2000), session);
+  assert.equal(session.index, 59);
+  assert.deepEqual(progress, feedbackBefore);
+});
+
+test('fully studied learning has no continuation but an unfinished explicit repeat remains resumable', () => {
+  const progress = emptyProgress();
+  for (const question of map.values()) recordAnswer(progress, question, question.correctOptionId);
+  assert.equal(learningContinuation(data.tickets, progress), null);
+  assert.equal(learningContinuation(data.tickets, progress, 1), null);
+  const repeat = createSession(data.tickets, 'learn', { ticketId: 1, remainingOnly: false, repeat: true }, progress, 1000);
+  assert.equal(repeat.repeat, true);
+  repeat.index = 1;
+  repeat.responses[repeat.questionIds[0]] = map.get(repeat.questionIds[0]).correctOptionId;
+  repeat.checked.push(repeat.questionIds[0]);
+  progress.modes.learn.session = repeat;
+  const before = structuredClone(progress);
+  assert.equal(learningContinuation(data.tickets, progress, 1, 2000), repeat);
+  assert.deepEqual(progress, before);
+  repeat.checked = [...repeat.questionIds];
+  assert.equal(learningContinuation(data.tickets, progress, 1, 2000), null);
+  repeat.status = 'finished';
+  assert.equal(learningContinuation(data.tickets, progress, 1, 2000), null);
+});
+
+test('an old implicit repeat of a completed ticket yields the remaining 56 questions', () => {
+  const progress = emptyProgress();
+  const questions = [...map.values()];
+  for (const question of questions.slice(0, 60)) recordAnswer(progress, question, question.correctOptionId);
+  const oldRepeat = createSession(data.tickets, 'learn', { ticketId: 1 }, progress, 1000);
+  assert.equal(Object.hasOwn(oldRepeat, 'repeat'), false);
+  oldRepeat.responses[first.id] = first.options[0].id;
+  progress.modes.learn.session = oldRepeat;
+  const before = structuredClone(progress);
+  const continuation = learningContinuation(data.tickets, progress, 1, 2000);
+  assert.notEqual(continuation, oldRepeat);
+  assert.deepEqual(continuation.questionIds, questions.slice(60).map(question => question.id));
+  assert.equal(continuation.index, 0);
+  assert.equal(continuation.startedAt, 2000);
+  assert.equal(continuation.questionIds.length, 56);
+  assert.deepEqual(progress, before);
+});
+
+test('an old unchecked all-bank session excludes its 60 studied questions through continuation and reload', () => {
+  const progress = emptyProgress();
+  const questions = [...map.values()];
+  for (const question of questions.slice(0, 60)) recordAnswer(progress, question, question.correctOptionId);
+  const oldSession = createSession(data.tickets, 'learn', {}, progress, 1000);
+  oldSession.responses[first.id] = first.options[0].id;
+  oldSession.responses[questions[60].id] = questions[60].options[0].id;
+  progress.modes.learn.session = oldSession;
+  const before = structuredClone(progress);
+  const continuation = learningContinuation(data.tickets, progress, 1, 2000);
+  assert.notEqual(continuation, oldSession);
+  assert.equal(continuation.index, 0);
+  assert.equal(continuation.questionIds.length, 56);
+  assert.equal(continuation.questionIds[continuation.index], questions[60].id);
+  assert.deepEqual(continuation.questionIds, questions.slice(60).map(question => question.id));
+  assert.ok(continuation.questionIds.every(id => !progress.modes.learn.answers[id]));
+  assert.equal(continuation.responses, oldSession.responses);
+  assert.equal(continuation.checked, oldSession.checked);
+  assert.equal(continuation.startedAt, 1000);
+  assert.equal(oldSession.index, 0);
+  assert.equal(statsFor(progress, map.size, 'learn').attempts, 60);
+  assert.deepEqual(progress, before);
+  const saved = {
+    ...progress,
+    modes: { ...progress.modes, learn: { ...progress.modes.learn, session: continuation } },
+  };
+  const restored = restoreProgress(JSON.parse(JSON.stringify(saved)), map);
+  assert.deepEqual(restored.modes.learn.session.questionIds, continuation.questionIds);
+  assert.equal(restored.modes.learn.session.index, 0);
+  assert.equal(restored.modes.learn.session.responses[questions[60].id], questions[60].options[0].id);
+  assert.equal(restored.modes.learn.session.startedAt, 1000);
+  assert.equal(statsFor(restored, map.size, 'learn').studied, 60);
+  assert.ok(restored.modes.learn.session.questionIds.every(id => !restored.modes.learn.answers[id]));
 });
