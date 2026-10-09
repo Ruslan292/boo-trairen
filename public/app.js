@@ -1,4 +1,5 @@
-import { STORAGE_KEY, emptyProgress, questionMap, restoreProgress, createSession, recordAnswer, finishSession, resultFor, statsFor } from './model.js?v=2';
+import { STORAGE_KEY, emptyProgress, questionMap, restoreProgress, createSession, recordAnswer, finishSession, resultFor, statsFor } from './model.js?v=3';
+import { renderDashboard } from './dashboard.js?v=3';
 
 const app = document.querySelector('#app');
 const paths = {
@@ -24,7 +25,7 @@ const time = milliseconds => { const seconds = Math.max(0, Math.ceil(millisecond
 let data, questions, progress;
 let page = 'home';
 let selectedMode = 'learn';
-let settings = { ticketId: 0, minutes: 10, allowedErrors: 1 };
+let sessionMode = 'learn';
 let storageWarning = false;
 let pendingStart = null;
 
@@ -33,8 +34,17 @@ function save() {
   catch { storageWarning = true; }
 }
 
-function ticketOptions() {
-  return `<option value="0">${selectedMode === 'exam' ? 'Случайный билет' : 'Все билеты'}</option>${data.tickets.map(ticket => `<option value="${ticket.id}" ${settings.ticketId === ticket.id ? 'selected' : ''}>Билет № ${ticket.id} · ${countQuestions(ticket.questions.length)}</option>`).join('')}`;
+const modeSession = (mode = sessionMode) => progress.modes[mode].session;
+const modeSettings = (mode = selectedMode) => progress.modes[mode].settings;
+
+function selectMode(mode) {
+  selectedMode = progress.selectedMode = mode;
+  save();
+}
+
+function resume(mode = selectedMode) {
+  if (!modeSession(mode)) return;
+  selectMode(mode); sessionMode = mode; page = 'session'; render(true);
 }
 
 function shell(content) {
@@ -59,27 +69,12 @@ function heading(eyebrow, title, description = '') {
 }
 
 function home() {
-  const stats = statsFor(progress, questions.size);
-  const percent = Math.round(stats.studied / stats.total * 100);
-  const session = progress.session;
-  const modes = [
-    ['learn', 'book', 'Обучение', 'Ответы и подсказки после каждого вопроса.'],
-    ['exam', 'clock', 'Экзамен', 'Один билет, таймер и результат в конце.'],
-    ['mistakes', 'repeat', 'Работа над ошибками', 'Повторите вопросы, которые вызвали трудности.'],
-  ];
-  const mode = modes.find(item => item[0] === selectedMode);
-  shell(`${heading('ЗНАНИЯ, КОТОРЫЕ ДАЮТ УВЕРЕННОСТЬ', 'Подготовьтесь спокойно.', 'Все билеты в одном месте. Практикуйтесь, проверяйте себя и возвращайтесь к сложным вопросам.')}
-    <section class="hero"><div class="hero-content"><span class="hero-tag">БЕЗОПАСНОСТЬ НАЧИНАЕТСЯ СО ЗНАНИЙ</span><h2>От первого вопроса<br>до уверенного ответа.</h2><p>Небольшая практика каждый день —<br>и сложное становится понятным.</p><button class="button hero-button" data-action="quick-learn">Начать обучение ${icon('arrow')}</button></div><div class="hero-art" aria-hidden="true"><svg viewBox="0 0 300 230"><circle cx="170" cy="115" r="98" fill="#d2e6d7"/><circle cx="170" cy="115" r="72" fill="none" stroke="#b6d2bc" stroke-dasharray="4 7"/><path d="m83 90 64-20 71 27-8 91-66-19-68 16z" fill="#fbfcf3" stroke="#176956" stroke-width="2"/><path d="m83 90 61 20 74-13M144 110v59" fill="none" stroke="#176956" stroke-width="2"/><path d="m96 112 33 10m-35 5 35 10m-36 5 35 10m25-31 47-8m-47 23 45-8m-45 22 31-5" stroke="#b7c6aa" stroke-width="3" stroke-linecap="round"/><path d="m190 33 39 14v28c0 26-26 43-39 50-13-7-39-24-39-50V47z" fill="#176956"/><path d="m172 76 13 13 24-28" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="77" cy="52" r="7" fill="#e3b86b"/><path d="M239 166v16m-8-8h16M59 115v12m-6-6h12" stroke="#176956" stroke-width="2"/><circle cx="224" cy="208" r="4" fill="#176956"/></svg></div></section>
-    <section class="stats" aria-label="Ваш прогресс"><div class="stat-card"><span class="stat-icon">${icon('book')}</span><div><span class="stat-label">Изучено вопросов</span><strong>${stats.studied}<small> / ${stats.total}</small></strong></div></div><div class="stat-card"><span class="stat-icon">${icon('check')}</span><div><span class="stat-label">Точность ответов</span><strong>${stats.accuracy === null ? '—' : `${stats.accuracy}%`}</strong></div></div><div class="stat-card"><span class="stat-icon warm">${icon('repeat')}</span><div><span class="stat-label">Нужно повторить</span><strong>${stats.mistakes}<small> ${declension(stats.mistakes, ['вопрос', 'вопроса', 'вопросов'])}</small></strong></div></div></section>
-    ${session?.status === 'active' ? `<div class="resume-card"><div>${icon('clock')}<span><strong>У вас есть незавершённая ${session.mode === 'exam' ? 'попытка экзамена' : 'тренировка'}</strong><small>Вопрос ${session.index + 1} из ${session.questionIds.length}${session.mode === 'exam' ? ' · таймер продолжает идти' : ''}</small></span></div><button class="button secondary" data-action="resume">Продолжить ${icon('arrow')}</button></div>` : ''}
-    <div class="dashboard-columns"><section class="practice"><div class="section-title"><h2>Как будем готовиться?</h2><span>Выберите свой формат</span></div><div class="mode-grid">${modes.map(([id, symbol, name, description]) => `<button class="mode-card ${selectedMode === id ? 'selected' : ''}" data-action="mode" data-mode="${id}" aria-pressed="${selectedMode === id}"><span class="mode-top">${icon(symbol)}<span class="radio-dot"></span></span><strong>${name}</strong><span>${description}</span></button>`).join('')}</div><div class="launch-panel"><div class="settings-row"><label>Выберите билет<select id="ticket-select" data-setting="ticketId">${ticketOptions()}</select></label>${selectedMode === 'exam' ? `<label>Время<select data-setting="minutes"><option value="5" ${settings.minutes === 5 ? 'selected' : ''}>5 минут</option><option value="10" ${settings.minutes === 10 ? 'selected' : ''}>10 минут</option><option value="20" ${settings.minutes === 20 ? 'selected' : ''}>20 минут</option></select></label><label>Допустимо ошибок<select data-setting="allowedErrors">${[0, 1, 2].map(number => `<option value="${number}" ${settings.allowedErrors === number ? 'selected' : ''}>${number}</option>`).join('')}</select></label>` : ''}</div><button class="button primary" data-action="start" ${selectedMode === 'mistakes' && !stats.mistakes ? 'disabled' : ''}>${selectedMode === 'exam' ? 'Начать экзамен' : selectedMode === 'mistakes' ? 'Повторить ошибки' : 'Начать тренировку'} ${icon('arrow')}</button><p class="launch-note">${selectedMode === 'exam' ? 'Это настройки учебного экзамена. Ответы появятся после завершения.' : selectedMode === 'mistakes' ? (stats.mistakes ? 'Верный ответ уберёт вопрос из списка ошибок.' : 'Здесь появятся вопросы, на которые вы ответили неверно.') : 'Можно остановиться и продолжить позже.'}</p></div></section>
-    <aside class="progress-card"><span class="eyebrow">ВАШ ПУТЬ</span><h2>Каждый ответ —<br>шаг вперёд.</h2><div class="progress-number">${percent}<span>%</span></div><progress value="${stats.studied}" max="${stats.total}" aria-label="Доля изученных вопросов"></progress><p>Вы ответили на ${countQuestions(stats.studied)} из ${stats.total}.</p><div class="tip">${icon('star')}<p>Начните с обучения, закрепите ошибки, а затем проверьте себя на экзамене.</p></div></aside></div>
-    <div class="source-note">${icon('book')}<span>Источник вопросов и ответов: ${escape(data.source)}</span></div>`);
+  shell(renderDashboard({ data, progress, selectedMode, icon, escape, countQuestions, time, heading }));
 }
 
 function ticketsPage() {
   shell(`${heading('БАЗА ВОПРОСОВ', 'Все билеты', `${data.tickets.length} учебных билетов без повторов. Последний билет содержит ${countQuestions(data.tickets.at(-1).questions.length)}. Выберите любой для тренировки.`)}<div class="ticket-grid">${data.tickets.map(ticket => {
-    const answered = ticket.questions.filter(question => progress.answers[question.id]).length;
+    const answered = ticket.questions.filter(question => progress.modes.learn.answers[question.id]).length;
     return `<article class="ticket-card"><span class="ticket-number">${String(ticket.id).padStart(2, '0')}</span><h2>Билет № ${ticket.id}</h2><p>${countQuestions(ticket.questions.length)}</p><progress value="${answered}" max="${ticket.questions.length}" aria-label="Прогресс билета ${ticket.id}"></progress><span class="ticket-progress">Изучено ${answered} из ${ticket.questions.length}</span><button class="button secondary" data-action="ticket-learn" data-ticket="${ticket.id}">Пройти билет ${icon('arrow')}</button></article>`;
   }).join('')}</div>`);
 }
@@ -94,7 +89,7 @@ function historyPage() {
 }
 
 function sessionPage() {
-  const session = progress.session;
+  const session = modeSession();
   if (!session) { page = 'home'; home(); return; }
   if (session.status === 'finished') { resultsPage(); return; }
   const id = session.questionIds[session.index];
@@ -115,7 +110,7 @@ function sessionPage() {
 }
 
 function resultsPage() {
-  const session = progress.session;
+  const session = modeSession();
   const result = resultFor(session, questions);
   const exam = session.mode === 'exam';
   const passed = exam ? result.passed : result.correct === result.total;
@@ -133,55 +128,71 @@ function render(focus = false) {
   if (focus) { document.querySelector('#main').focus({ preventScroll: true }); window.scrollTo({ top: 0 }); }
 }
 
-function start(mode, ticketId = settings.ticketId, replace = false) {
-  if (progress.session?.status === 'active') {
+function start(mode, ticketId = modeSettings(mode).ticketId, { fresh = false, repeat = false, replace = false } = {}) {
+  const previous = modeSession(mode);
+  if (previous?.status === 'active') {
+    if (!fresh) { resume(mode); return; }
     if (!replace) {
-      pendingStart = { mode, ticketId };
+      pendingStart = { mode, ticketId, repeat };
       const dialog = document.querySelector('#confirm-dialog');
-      dialog.querySelector('.eyebrow').textContent = 'НОВАЯ ТРЕНИРОВКА';
+      dialog.querySelector('.eyebrow').textContent = mode === 'exam' ? 'НОВЫЙ ЭКЗАМЕН' : 'НОВАЯ ТРЕНИРОВКА';
       dialog.querySelector('h2').textContent = 'Начать заново?';
-      dialog.querySelector('#confirm-description').textContent = progress.session.mode === 'exam' ? 'Текущий экзамен будет завершён. Вопросы без ответа будут считаться ошибками. Ваш общий прогресс сохранится.' : 'Текущая тренировка будет закрыта. Все проверенные ответы и ваш общий прогресс сохранятся.';
+      dialog.querySelector('#confirm-description').textContent = mode === 'exam' ? 'Текущий экзамен будет завершён. Вопросы без ответа будут считаться ошибками. Результаты сохранятся в истории.' : 'Текущая тренировка этого раздела будет закрыта. Все проверенные ответы и прогресс сохранятся.';
       dialog.querySelector('[data-action="cancel-finish"]').textContent = 'Отмена';
       dialog.querySelector('[data-action="confirm-finish"]').textContent = 'Начать новую';
       dialog.showModal();
       return;
     }
-    finishSession(progress, questions);
   }
-  const session = createSession(data.tickets, mode, { ...settings, ticketId }, progress);
-  if (!session) {
-    page = 'mistakes'; render(true); return;
-  }
-  progress.session = session;
-  save(); page = 'session'; render(true);
+  const settings = { ...modeSettings(mode), ticketId, remainingOnly: mode === 'learn' && !repeat };
+  let session = createSession(data.tickets, mode, settings, progress);
+  // Once all selected questions are studied, allow a fresh practice without resetting progress.
+  if (!session && mode === 'learn') session = createSession(data.tickets, mode, { ...settings, remainingOnly: false }, progress);
+  if (!session) { selectMode(mode); page = 'mistakes'; render(true); return; }
+  if (previous?.status === 'active') finishSession(progress, questions, mode);
+  modeSettings(mode).ticketId = ticketId;
+  progress.modes[mode].session = session;
+  selectMode(mode); sessionMode = mode; page = 'session'; render(true);
 }
 
 function finish() {
-  finishSession(progress, questions);
+  finishSession(progress, questions, sessionMode);
+  pendingStart = null;
   save(); page = 'session'; render(true);
+}
+
+function expireExam() {
+  const exam = modeSession('exam');
+  if (exam?.status !== 'active' || Date.now() < exam.deadline) return false;
+  finishSession(progress, questions, 'exam');
+  save();
+  if (page === 'session' && sessionMode === 'exam') { pendingStart = null; render(true); }
+  else if (['home', 'history', 'mistakes'].includes(page) && !document.querySelector('dialog[open]')) render();
+  return true;
 }
 
 function action(button) {
   const name = button.dataset.action;
-  const session = progress.session;
+  const session = modeSession();
   const active = session?.status === 'active';
   const id = active ? session.questionIds[session.index] : null;
-  if (active && session.mode === 'exam' && Date.now() >= session.deadline) { finish(); return; }
+  if (expireExam() && page === 'session' && sessionMode === 'exam' && ['answer', 'previous', 'next', 'jump', 'finish', 'confirm-finish'].includes(name)) return;
   switch (name) {
     case 'navigate': page = button.dataset.page; render(true); break;
-    case 'mode': selectedMode = button.dataset.mode; render(); break;
-    case 'choose-exam': selectedMode = 'exam'; page = 'home'; render(true); break;
+    case 'mode': selectMode(button.dataset.mode); render(); break;
+    case 'choose-exam': selectMode('exam'); page = 'home'; render(true); break;
     case 'start': start(selectedMode); break;
+    case 'new-session': start(selectedMode, modeSettings().ticketId, { fresh: true, repeat: true }); break;
     case 'quick-learn': start('learn', 0); break;
-    case 'ticket-learn': start('learn', Number(button.dataset.ticket)); break;
+    case 'ticket-learn': start('learn', Number(button.dataset.ticket), { fresh: true, repeat: true }); break;
     case 'review': start('mistakes', 0); break;
-    case 'resume': page = 'session'; render(true); break;
+    case 'resume': resume(button.dataset.mode || selectedMode); break;
     case 'answer':
       if (!active || (session.mode !== 'exam' && session.checked.includes(id))) return;
       session.responses[id] = Number(button.dataset.option); save(); render(); break;
     case 'check':
       if (!active || session.mode === 'exam' || session.checked.includes(id) || session.responses[id] === undefined) return;
-      recordAnswer(progress, questions.get(id), session.responses[id]); session.checked.push(id); save(); render(); break;
+      recordAnswer(progress, questions.get(id), session.responses[id], sessionMode); session.checked.push(id); save(); render(); break;
     case 'next':
       if (!active || (session.mode !== 'exam' && !session.checked.includes(id))) return;
       if (session.mode === 'exam') {
@@ -208,9 +219,9 @@ function action(button) {
       document.querySelector('#confirm-dialog').showModal();
       break;
     }
-    case 'cancel-finish': pendingStart = null; document.querySelector('#confirm-dialog').close(); break;
+    case 'cancel-finish': pendingStart = null; document.querySelector('#confirm-dialog').close(); if (page === 'home') render(); break;
     case 'confirm-finish':
-      if (pendingStart) { const next = pendingStart; pendingStart = null; start(next.mode, next.ticketId, true); }
+      if (pendingStart) { const next = pendingStart; pendingStart = null; start(next.mode, next.ticketId, { fresh: true, repeat: next.repeat, replace: true }); }
       else if (active && session.mode === 'exam') finish();
       break;
   }
@@ -222,10 +233,10 @@ app.addEventListener('click', event => {
 });
 app.addEventListener('change', event => {
   const setting = event.target.dataset.setting;
-  if (setting) settings[setting] = Number(event.target.value);
+  if (setting) { modeSettings()[setting] = Number(event.target.value); save(); if (page === 'home') render(); }
 });
 document.addEventListener('keydown', event => {
-  if (page !== 'session' || progress?.session?.status !== 'active' || document.querySelector('dialog[open]') || /INPUT|SELECT|TEXTAREA|BUTTON|A/.test(event.target.tagName) || event.ctrlKey || event.altKey || event.metaKey) return;
+  if (page !== 'session' || progress?.modes?.[sessionMode]?.session?.status !== 'active' || document.querySelector('dialog[open]') || /INPUT|SELECT|TEXTAREA|BUTTON|A/.test(event.target.tagName) || event.ctrlKey || event.altKey || event.metaKey) return;
   let button;
   if (/^[1-3]$/.test(event.key)) button = document.querySelector(`[data-action="answer"][data-option="${event.key}"]`);
   else if (event.key === 'Enter') button = document.querySelector('.exercise-actions .primary');
@@ -239,18 +250,30 @@ try {
   if (!Array.isArray(data.tickets) || !data.tickets.length) throw new Error('База вопросов пуста');
   questions = questionMap(data.tickets);
   progress = emptyProgress();
-  try { progress = restoreProgress(JSON.parse(localStorage.getItem(STORAGE_KEY)), questions); }
-  catch { storageWarning = true; }
+  try {
+    const previous = localStorage.getItem(STORAGE_KEY);
+    const raw = JSON.parse(previous);
+    progress = restoreProgress(raw, questions);
+    if (raw && [1, 2].includes(raw.version) && !localStorage.getItem(`${STORAGE_KEY}:legacy-backup`)) {
+      localStorage.setItem(`${STORAGE_KEY}:legacy-backup`, previous);
+    }
+  } catch { storageWarning = true; }
+  selectedMode = progress.selectedMode;
+  sessionMode = selectedMode;
   if (!storageWarning) save();
-  if (progress.session?.status === 'active' && progress.session.mode === 'exam' && progress.session.deadline <= Date.now()) { finishSession(progress, questions); save(); page = 'session'; }
+  const exam = modeSession('exam');
+  if (exam?.status === 'active' && exam.deadline <= Date.now()) {
+    finishSession(progress, questions, 'exam'); save();
+    if (selectedMode === 'exam') page = 'session';
+  }
   render();
   setInterval(() => {
-    const session = progress.session;
-    if (session?.status !== 'active' || session.mode !== 'exam') return;
-    if (Date.now() >= session.deadline) { finish(); return; }
-    const timer = document.querySelector('#timer span');
-    if (timer) timer.textContent = time(session.deadline - Date.now());
-    document.querySelector('#timer')?.classList.toggle('urgent', session.deadline - Date.now() < 60_000);
+    if (expireExam()) return;
+    const exam = modeSession('exam');
+    if (exam?.status !== 'active') return;
+    const remaining = exam.deadline - Date.now();
+    for (const timer of document.querySelectorAll('#timer span, [data-exam-time]')) timer.textContent = time(remaining);
+    document.querySelector('#timer')?.classList.toggle('urgent', remaining < 60_000);
   }, 1000);
 } catch (error) {
   app.innerHTML = `<div class="loading error-state"><h1>Не удалось открыть тренажёр</h1><p>${escape(error.message)}</p><p>Проверьте подключение и попробуйте обновить страницу.</p><button class="button primary" id="retry">Попробовать снова</button></div>`;
