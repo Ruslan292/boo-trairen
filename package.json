@@ -1,0 +1,12 @@
+{
+  "name": "boo-trainer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/serve.mjs",
+    "dev": "node scripts/serve.mjs",
+    "extract": "python3 scripts/extract_questions.py",
+    "test": "node --test tests/model.test.mjs && python3 -m unittest discover -s tests -p 'test_*.py'"
+  }
+}
