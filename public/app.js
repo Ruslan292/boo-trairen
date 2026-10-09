@@ -1,4 +1,4 @@
-import { STORAGE_KEY, emptyProgress, questionMap, restoreProgress, createSession, recordAnswer, finishSession, resultFor, statsFor } from './model.js';
+import { STORAGE_KEY, emptyProgress, questionMap, restoreProgress, createSession, recordAnswer, finishSession, resultFor, statsFor } from './model.js?v=2';
 
 const app = document.querySelector('#app');
 const paths = {
@@ -34,7 +34,7 @@ function save() {
 }
 
 function ticketOptions() {
-  return `<option value="0">${selectedMode === 'exam' ? 'Случайный билет' : 'Все билеты'}</option>${data.tickets.map(ticket => `<option value="${ticket.id}" ${settings.ticketId === ticket.id ? 'selected' : ''}>Билет № ${ticket.id}</option>`).join('')}`;
+  return `<option value="0">${selectedMode === 'exam' ? 'Случайный билет' : 'Все билеты'}</option>${data.tickets.map(ticket => `<option value="${ticket.id}" ${settings.ticketId === ticket.id ? 'selected' : ''}>Билет № ${ticket.id} · ${countQuestions(ticket.questions.length)}</option>`).join('')}`;
 }
 
 function shell(content) {
@@ -45,7 +45,7 @@ function shell(content) {
       <a class="brand" href="./" aria-label="БОО — главная"><span class="brand-mark">${icon('shield')}</span><span>БОО<span class="brand-caption">ТРЕНАЖЁР</span></span></a>
       <div class="nav-caption">ВАША ПОДГОТОВКА</div>
       <nav aria-label="Основная навигация">${navigation.map(([id, symbol, label]) => `<button class="nav-item ${page === id ? 'active' : ''}" data-action="navigate" data-page="${id}" ${page === id ? 'aria-current="page"' : ''}>${icon(symbol)}<span>${label}</span>${id === 'mistakes' && stats.mistakes ? `<span class="nav-count">${stats.mistakes}</span>` : ''}</button>`).join('')}</nav>
-      <div class="sidebar-bottom"><span class="source-dot"></span>Билеты из документа · 2026<p>${data.tickets.length} билетов · ${questions.size} вопросов</p><span class="local-note">Прогресс хранится в этом браузере</span></div>
+      <div class="sidebar-bottom"><span class="source-dot"></span>Учебные билеты · 2026<p>${data.tickets.length} билетов · ${questions.size} вопросов</p><span class="local-note">Прогресс хранится в этом браузере</span></div>
     </aside>
     <div class="workspace"><header class="topbar"><span>Безопасное обращение с оружием</span><span class="edition">${icon('shield')} Подготовка · 2026</span></header>
       <main id="main" tabindex="-1">${storageWarning ? '<div class="notice">Браузер не разрешил сохранить прогресс. Текущая тренировка доступна, но после закрытия страницы её результаты могут потеряться.</div>' : ''}${content}</main>
@@ -78,7 +78,7 @@ function home() {
 }
 
 function ticketsPage() {
-  shell(`${heading('БАЗА ВОПРОСОВ', 'Все билеты', `${data.tickets.length} билетов из исходного документа. Выберите любой для тренировки.`)}<div class="ticket-grid">${data.tickets.map(ticket => {
+  shell(`${heading('БАЗА ВОПРОСОВ', 'Все билеты', `${data.tickets.length} учебных билетов без повторов. Последний билет содержит ${countQuestions(data.tickets.at(-1).questions.length)}. Выберите любой для тренировки.`)}<div class="ticket-grid">${data.tickets.map(ticket => {
     const answered = ticket.questions.filter(question => progress.answers[question.id]).length;
     return `<article class="ticket-card"><span class="ticket-number">${String(ticket.id).padStart(2, '0')}</span><h2>Билет № ${ticket.id}</h2><p>${countQuestions(ticket.questions.length)}</p><progress value="${answered}" max="${ticket.questions.length}" aria-label="Прогресс билета ${ticket.id}"></progress><span class="ticket-progress">Изучено ${answered} из ${ticket.questions.length}</span><button class="button secondary" data-action="ticket-learn" data-ticket="${ticket.id}">Пройти билет ${icon('arrow')}</button></article>`;
   }).join('')}</div>`);
@@ -90,7 +90,7 @@ function mistakesPage() {
 }
 
 function historyPage() {
-  shell(`${heading('РЕЗУЛЬТАТЫ ПОДГОТОВКИ', 'История экзаменов', 'Ваши последние 50 попыток сохраняются в этом браузере.')}${progress.exams.length ? `<div class="history-list">${[...progress.exams].reverse().map(exam => `<article class="history-item"><span class="result-mark ${exam.passed ? 'success' : 'failure'}">${icon(exam.passed ? 'check' : 'repeat')}</span><div><h2>Билет № ${exam.ticketId}</h2><p>${date(exam.finishedAt)} · ${time(exam.duration)}</p><small>Допустимо ошибок: ${exam.allowedErrors}</small></div><div class="history-score"><strong>${exam.correct} / ${exam.total}</strong><span>${exam.passed ? 'Экзамен сдан' : 'Нужно повторить'}</span></div></article>`).join('')}</div>` : `<div class="empty-state"><span class="empty-icon">${icon('chart')}</span><h2>Всё ещё впереди</h2><p>Пройдите учебный экзамен, чтобы увидеть первый результат.</p><button class="button primary" data-action="choose-exam">Подготовиться к экзамену ${icon('arrow')}</button></div>`}`);
+  shell(`${heading('РЕЗУЛЬТАТЫ ПОДГОТОВКИ', 'История экзаменов', 'Ваши последние 50 попыток сохраняются в этом браузере.')}${progress.exams.length ? `<div class="history-list">${[...progress.exams].reverse().map(exam => `<article class="history-item"><span class="result-mark ${exam.passed ? 'success' : 'failure'}">${icon(exam.passed ? 'check' : 'repeat')}</span><div><h2>${exam.bankVersion === 1 ? "Исходный билет" : "Билет"} № ${exam.ticketId}</h2><p>${date(exam.finishedAt)} · ${time(exam.duration)}</p><small>Допустимо ошибок: ${exam.allowedErrors}</small></div><div class="history-score"><strong>${exam.correct} / ${exam.total}</strong><span>${exam.passed ? 'Экзамен сдан' : 'Нужно повторить'}</span></div></article>`).join('')}</div>` : `<div class="empty-state"><span class="empty-icon">${icon('chart')}</span><h2>Всё ещё впереди</h2><p>Пройдите учебный экзамен, чтобы увидеть первый результат.</p><button class="button primary" data-action="choose-exam">Подготовиться к экзамену ${icon('arrow')}</button></div>`}`);
 }
 
 function sessionPage() {
@@ -105,7 +105,7 @@ function sessionPage() {
   const exam = session.mode === 'exam';
   const answered = exam ? Object.keys(session.responses).length : session.checked.length;
   shell(`<div class="session-heading"><button class="text-button" data-action="navigate" data-page="home">${icon('chevron')} К обзору</button><span class="session-mode">${icon(exam ? 'clock' : session.mode === 'mistakes' ? 'repeat' : 'book')}${exam ? 'Учебный экзамен' : session.mode === 'mistakes' ? 'Работа над ошибками' : 'Обучение'}</span>${exam ? `<span class="timer" id="timer" aria-label="Оставшееся время">${icon('clock')}<span>${time(session.deadline - Date.now())}</span></span>` : ''}</div>
-    <div class="exercise-layout"><section class="exercise"><div class="exercise-top"><span class="eyebrow">БИЛЕТ № ${question.ticketId}</span><span>Вопрос ${session.index + 1} из ${session.questionIds.length}</span></div><progress value="${answered}" max="${session.questionIds.length}" aria-label="Прогресс тренировки"></progress><h1 class="question-text">${escape(question.text)}</h1><div class="answers" role="group" aria-label="Варианты ответа">${question.options.map(option => {
+    <div class="exercise-layout"><section class="exercise"><div class="exercise-top"><span class="eyebrow">${session.bankVersion === 1 && session.ticketId ? "ИСХОДНЫЙ БИЛЕТ № " + session.ticketId : "БИЛЕТ № " + question.ticketId}</span><span>Вопрос ${session.index + 1} из ${session.questionIds.length}</span></div><progress value="${answered}" max="${session.questionIds.length}" aria-label="Прогресс тренировки"></progress><h1 class="question-text">${escape(question.text)}</h1><div class="answers" role="group" aria-label="Варианты ответа">${question.options.map(option => {
       const selected = response === option.id;
       let state = selected ? 'chosen' : '';
       if (checked && !exam) state = option.id === question.correctOptionId ? 'correct' : selected ? 'incorrect' : '';
@@ -120,7 +120,7 @@ function resultsPage() {
   const exam = session.mode === 'exam';
   const passed = exam ? result.passed : result.correct === result.total;
   const incorrect = session.questionIds.filter(id => session.responses[id] !== questions.get(id).correctOptionId);
-  shell(`<section class="results"><span class="result-mark large ${passed ? 'success' : 'failure'}">${icon(passed ? 'check' : 'book')}</span><span class="eyebrow">${exam ? 'РЕЗУЛЬТАТ ЭКЗАМЕНА' : 'ТРЕНИРОВКА ЗАВЕРШЕНА'}</span><h1>${exam ? passed ? 'Отлично, экзамен сдан!' : 'Ещё немного практики.' : 'Вы стали на шаг увереннее.'}</h1><p>${exam ? `Билет № ${session.ticketId} · допустимо ошибок: ${session.allowedErrors}` : 'Вернитесь к сложным вопросам, чтобы закрепить знания.'}</p><div class="result-stats"><div><strong>${result.correct}<small> / ${result.total}</small></strong><span>Правильных ответов</span></div><div><strong>${result.errors}</strong><span>Ошибок${result.answered < result.total ? ` (пропущено: ${result.total - result.answered})` : ''}</span></div><div><strong>${time(Math.max(0, Math.min(session.finishedAt, session.deadline || session.finishedAt) - session.startedAt))}</strong><span>Время подготовки</span></div></div><div class="results-actions">${progress.mistakes.length ? `<button class="button primary" data-action="review">Повторить ошибки ${icon('repeat')}</button>` : ''}<button class="button secondary" data-action="navigate" data-page="home">К обзору ${icon('arrow')}</button></div></section>${incorrect.length ? `<section class="review-results"><h2>Разбор ответов</h2><p class="muted">Правильные варианты из исходного документа.</p>${incorrect.map(id => {
+  shell(`<section class="results"><span class="result-mark large ${passed ? 'success' : 'failure'}">${icon(passed ? 'check' : 'book')}</span><span class="eyebrow">${exam ? 'РЕЗУЛЬТАТ ЭКЗАМЕНА' : 'ТРЕНИРОВКА ЗАВЕРШЕНА'}</span><h1>${exam ? passed ? 'Отлично, экзамен сдан!' : 'Ещё немного практики.' : 'Вы стали на шаг увереннее.'}</h1><p>${exam ? `${session.bankVersion === 1 ? "Исходный билет" : "Билет"} № ${session.ticketId} · допустимо ошибок: ${session.allowedErrors}` : 'Вернитесь к сложным вопросам, чтобы закрепить знания.'}</p><div class="result-stats"><div><strong>${result.correct}<small> / ${result.total}</small></strong><span>Правильных ответов</span></div><div><strong>${result.errors}</strong><span>Ошибок${result.answered < result.total ? ` (пропущено: ${result.total - result.answered})` : ''}</span></div><div><strong>${time(Math.max(0, Math.min(session.finishedAt, session.deadline || session.finishedAt) - session.startedAt))}</strong><span>Время подготовки</span></div></div><div class="results-actions">${progress.mistakes.length ? `<button class="button primary" data-action="review">Повторить ошибки ${icon('repeat')}</button>` : ''}<button class="button secondary" data-action="navigate" data-page="home">К обзору ${icon('arrow')}</button></div></section>${incorrect.length ? `<section class="review-results"><h2>Разбор ответов</h2><p class="muted">Правильные варианты из исходного документа.</p>${incorrect.map(id => {
     const question = questions.get(id);
     const chosen = question.options.find(option => option.id === session.responses[id]);
     const correct = question.options.find(option => option.id === question.correctOptionId);
@@ -184,8 +184,15 @@ function action(button) {
       recordAnswer(progress, questions.get(id), session.responses[id]); session.checked.push(id); save(); render(); break;
     case 'next':
       if (!active || (session.mode !== 'exam' && !session.checked.includes(id))) return;
-      if (session.index + 1 === session.questionIds.length) finish();
-      else { session.index++; save(); render(true); }
+      if (session.mode === 'exam') {
+        if (session.index + 1 === session.questionIds.length) finish();
+        else { session.index++; save(); render(true); }
+      } else {
+        let nextIndex = session.questionIds.findIndex((questionId, index) => index > session.index && !session.checked.includes(questionId));
+        if (nextIndex === -1) nextIndex = session.questionIds.findIndex(questionId => !session.checked.includes(questionId));
+        if (nextIndex === -1) finish();
+        else { session.index = nextIndex; save(); render(true); }
+      }
       break;
     case 'previous':
       if (active && session.mode === 'exam' && session.index > 0) { session.index--; save(); render(true); }
@@ -226,7 +233,7 @@ document.addEventListener('keydown', event => {
 });
 
 try {
-  const response = await fetch('./questions.json');
+  const response = await fetch('./questions.json?v=2');
   if (!response.ok) throw new Error(`Не удалось загрузить вопросы (${response.status})`);
   data = await response.json();
   if (!Array.isArray(data.tickets) || !data.tickets.length) throw new Error('База вопросов пуста');
@@ -234,6 +241,7 @@ try {
   progress = emptyProgress();
   try { progress = restoreProgress(JSON.parse(localStorage.getItem(STORAGE_KEY)), questions); }
   catch { storageWarning = true; }
+  if (!storageWarning) save();
   if (progress.session?.status === 'active' && progress.session.mode === 'exam' && progress.session.deadline <= Date.now()) { finishSession(progress, questions); save(); page = 'session'; }
   render();
   setInterval(() => {

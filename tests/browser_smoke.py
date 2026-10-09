@@ -9,6 +9,7 @@ Screenshots are written outside the checkout, under /tmp.
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 from playwright.sync_api import expect, sync_playwright
@@ -19,6 +20,10 @@ DATA = json.loads((Path(__file__).resolve().parents[1] / "public/questions.json"
 FIRST_TICKET = DATA["tickets"][0]
 FIRST = FIRST_TICKET["questions"][0]
 SECOND = FIRST_TICKET["questions"][1]
+FIRST_TICKET_ID = str(FIRST_TICKET["id"])
+FIRST_TICKET_SIZE = len(FIRST_TICKET["questions"])
+ALL_QUESTIONS = [question for ticket in DATA["tickets"] for question in ticket["questions"]]
+LAST_TICKET = DATA["tickets"][-1]
 
 
 def action(page, name, extra=""):
@@ -55,6 +60,184 @@ def monitor(page, errors):
     page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
 
 
+def question_signature(question):
+    def normalized(value):
+        return re.sub(r"\s+", " ", value.lower().replace("ё", "е")).strip()
+    return normalized(question["text"]), tuple(normalized(option["text"]) for option in question["options"])
+
+
+def deduplicated_learning_flow(browser, base_url, errors):
+    context = browser.new_context()
+    page = context.new_page()
+    monitor(page, errors)
+    page.goto(base_url)
+    wait_home(page)
+    page.locator('[data-setting="ticketId"]').select_option("0")
+    action(page, "start").click()
+    session = stored(page)["session"]
+    assert len(session["questionIds"]) == len(ALL_QUESTIONS)
+    assert len(set(session["questionIds"])) == len(ALL_QUESTIONS)
+    seen = set()
+    for index, question in enumerate(ALL_QUESTIONS):
+        expect(page.locator(".question-text")).to_have_text(question["text"])
+        signature = question_signature(question)
+        assert signature not in seen, f"Repeated question in all-bank learning: {question['id']}"
+        seen.add(signature)
+        choose_answer(page, question)
+        action(page, "check").click()
+        expect(page.locator(".feedback.positive")).to_be_visible()
+        action(page, "next").click()
+        if (index + 1) % 25 == 0:
+            print(f"  all-bank learning: {index + 1}/{len(ALL_QUESTIONS)} unique questions")
+    expect(page.locator(".results h1")).to_have_text("Вы стали на шаг увереннее.")
+    expect(page.locator(".result-stats > div").nth(0)).to_contain_text(f"{len(ALL_QUESTIONS)} / {len(ALL_QUESTIONS)}")
+    assert len(stored(page)["answers"]) == len(ALL_QUESTIONS)
+    assert stored(page)["mistakes"] == []
+    print(f"PASS all-bank learning completes {len(ALL_QUESTIONS)} questions without repeats")
+    context.close()
+
+
+def incomplete_ticket_flow(browser, base_url, errors):
+    context = browser.new_context()
+    page = context.new_page()
+    monitor(page, errors)
+    page.goto(base_url)
+    wait_home(page)
+    size = len(LAST_TICKET["questions"])
+    assert size < FIRST_TICKET_SIZE, "Regression fixture requires a final incomplete ticket"
+    for mode in ("learn", "exam"):
+        if mode == "exam":
+            navigate(page, "home")
+            action(page, "mode", '[data-mode="exam"]').click()
+            page.locator('[data-setting="allowedErrors"]').select_option("0")
+        page.locator('[data-setting="ticketId"]').select_option(str(LAST_TICKET["id"]))
+        action(page, "start").click()
+        assert len(stored(page)["session"]["questionIds"]) == size
+        for index, question in enumerate(LAST_TICKET["questions"]):
+            expect(page.locator(".question-text")).to_have_text(question["text"])
+            expect(page.locator(".exercise-top")).to_contain_text(f"Вопрос {index + 1} из {size}")
+            choose_answer(page, question)
+            if mode == "learn":
+                action(page, "check").click()
+                action(page, "next").click()
+            elif index + 1 < size:
+                action(page, "next").click()
+            else:
+                action(page, "finish").first.click()
+                action(page, "confirm-finish").click()
+        expect(page.locator(".results h1")).to_be_visible()
+        expect(page.locator(".result-stats > div").nth(0)).to_contain_text(f"{size} / {size}")
+        expect(page.locator(".result-stats > div").nth(1).locator("strong")).to_have_text("0")
+        assert stored(page)["session"]["status"] == "finished"
+    record = stored(page)["exams"][-1]
+    assert record["correct"] == record["total"] == size
+    assert record["bankVersion"] == 2
+    navigate(page, "history")
+    expect(page.locator(".history-score")).to_contain_text(f"{size} / {size}")
+    print(f"PASS final {size}-question ticket completes in learning and exam with correct score")
+    context.close()
+
+
+def migration_fixture(page, duplicate, distinct, mode, index):
+    aliases = duplicate["aliases"][:2]
+    distinct_alias = distinct["aliases"][0]
+    wrong = next(option["id"] for option in duplicate["options"] if option["id"] != duplicate["correctOptionId"])
+    now = page.evaluate("Date.now()")
+    old_record = {"ticketId": 1, "total": 10, "correct": 9, "answered": 10, "errors": 1,
+                  "passed": True, "allowedErrors": 1, "finishedAt": now - 100000, "duration": 300000}
+    value = {
+        "version": 1,
+        "answers": {aliases[0]: {"attempts": 2, "correct": 1}, aliases[1]: {"attempts": 3, "correct": 2}},
+        "mistakes": aliases + [aliases[0]],
+        "exams": [old_record],
+        "session": {
+            "mode": mode, "ticketId": None if mode == "learn" else 1,
+            "questionIds": aliases + [distinct_alias], "index": index,
+            "responses": {aliases[0]: wrong, aliases[1]: wrong},
+            "checked": (aliases if index == 2 else aliases[:1]) if mode == "learn" else [],
+            "startedAt": now - 30000, "deadline": now + 270000 if mode == "exam" else None,
+            "allowedErrors": 1, "status": "active",
+        },
+    }
+    page.evaluate("({key, value}) => localStorage.setItem(key, JSON.stringify(value))", {"key": STORAGE_KEY, "value": value})
+    return value
+
+
+def migration_flow(browser, base_url, errors):
+    duplicate = next(question for question in ALL_QUESTIONS if len(question.get("aliases", [])) >= 2)
+    distinct = next(question for question in ALL_QUESTIONS if question["id"] != duplicate["id"])
+    for old_index in (2, 1):
+        context = browser.new_context()
+        page = context.new_page()
+        monitor(page, errors)
+        page.goto(base_url)
+        wait_home(page)
+        migration_fixture(page, duplicate, distinct, "learn", old_index)
+        page.reload()
+        wait_home(page)
+        migrated = stored(page)
+        assert migrated["version"] == 2
+        assert migrated["answers"] == {duplicate["id"]: {"attempts": 5, "correct": 3}}
+        assert migrated["mistakes"] == [duplicate["id"]]
+        assert migrated["session"]["questionIds"] == [duplicate["id"], distinct["id"]]
+        assert migrated["session"]["checked"] == [duplicate["id"]]
+        assert migrated["session"]["index"] == 1, f"Migrated current question from source index {old_index} must advance to the distinct question"
+        assert migrated["exams"][0]["bankVersion"] == 1
+        expect(page.locator(".stat-card").nth(0)).to_contain_text(f"1 / {len(ALL_QUESTIONS)}")
+        expect(page.locator(".stat-card").nth(1)).to_contain_text("60%")
+        navigate(page, "mistakes")
+        expect(page.locator(".list-question")).to_have_count(1)
+        navigate(page, "history")
+        expect(page.locator(".history-item")).to_have_count(1)
+        expect(page.locator(".history-score")).to_contain_text("9 / 10")
+        navigate(page, "home")
+        action(page, "resume").click()
+        expect(page.locator(".question-text")).to_have_text(distinct["text"])
+        expect(page.locator(".exercise-top")).to_contain_text("Вопрос 2 из 2")
+        expect(page.locator(".feedback")).to_have_count(0)
+        page.reload()
+        wait_home(page)
+        assert stored(page) == migrated, "Repeated load must not merge migrated attempts again"
+        action(page, "resume").click()
+        choose_answer(page, distinct)
+        action(page, "check").click()
+        action(page, "next").click()
+        expect(page.locator(".result-stats > div").nth(0)).to_contain_text("1 / 2")
+        assert stored(page)["answers"][duplicate["id"]] == {"attempts": 5, "correct": 3}
+        assert stored(page)["answers"][distinct["id"]] == {"attempts": 1, "correct": 1}
+        context.close()
+    print("PASS version1 learning migration merges aliases and preserves/skips current question without regrading")
+
+    context = browser.new_context()
+    page = context.new_page()
+    monitor(page, errors)
+    page.goto(base_url)
+    wait_home(page)
+    raw = migration_fixture(page, duplicate, distinct, "exam", 2)
+    page.reload()
+    wait_home(page)
+    action(page, "resume").click()
+    expect(page.locator("#timer")).to_be_visible()
+    migrated = stored(page)
+    assert migrated["version"] == 2
+    assert migrated["session"]["deadline"] == raw["session"]["deadline"]
+    assert migrated["session"]["startedAt"] == raw["session"]["startedAt"]
+    assert len(migrated["session"]["questionIds"]) == len(set(migrated["session"]["questionIds"]))
+    page.reload()
+    wait_home(page)
+    assert stored(page) == migrated
+    action(page, "resume").click()
+    expect(page.locator(".question-text")).to_have_text(distinct["text"])
+    choose_answer(page, distinct)
+    action(page, "finish").first.click()
+    action(page, "confirm-finish").click()
+    expect(page.locator(".results h1")).to_be_visible()
+    assert stored(page)["exams"][0]["bankVersion"] == 1
+    assert len(stored(page)["exams"]) == 2
+    print("PASS migrated exam preserves its original deadline and keeps old exam history")
+    context.close()
+
+
 def desktop_flow(browser, base_url, errors):
     context = browser.new_context(viewport={"width": 1440, "height": 1080})
     page = context.new_page()
@@ -62,10 +245,10 @@ def desktop_flow(browser, base_url, errors):
     page.goto(base_url)
     wait_home(page)
     expect(page.locator(".stat-card")).to_have_count(3)
-    assert page.locator('[data-setting="ticketId"] option').count() == 21
+    assert page.locator('[data-setting="ticketId"] option').count() == len(DATA["tickets"]) + 1
     no_overflow(page, "desktop home")
 
-    page.locator('[data-setting="ticketId"]').select_option("1")
+    page.locator('[data-setting="ticketId"]').select_option(FIRST_TICKET_ID)
     action(page, "start").click()
     expect(page.locator(".question-text")).to_have_text(FIRST["text"])
     expect(action(page, "check")).to_be_disabled()
@@ -116,7 +299,7 @@ def desktop_flow(browser, base_url, errors):
 
     navigate(page, "home")
     action(page, "mode", '[data-mode="exam"]').click()
-    page.locator('[data-setting="ticketId"]').select_option("1")
+    page.locator('[data-setting="ticketId"]').select_option(FIRST_TICKET_ID)
     page.locator('[data-setting="minutes"]').select_option("5")
     page.locator('[data-setting="allowedErrors"]').select_option("0")
     action(page, "start").click()
@@ -137,7 +320,7 @@ def desktop_flow(browser, base_url, errors):
         expect(page.locator(".question-text")).to_have_text(question["text"])
         choose_answer(page, question)
         expect(page.locator(".feedback, .answer.correct, .answer.incorrect")).to_have_count(0)
-        if index < 9:
+        if index < FIRST_TICKET_SIZE - 1:
             action(page, "next").click()
     action(page, "finish").first.click()
     expect(page.locator("dialog[open]")).to_contain_text("Все ответы выбраны")
@@ -146,18 +329,18 @@ def desktop_flow(browser, base_url, errors):
     action(page, "finish").first.click()
     action(page, "confirm-finish").click()
     expect(page.locator(".results h1")).to_have_text("Отлично, экзамен сдан!")
-    expect(page.locator(".result-stats > div").nth(0)).to_contain_text("10 / 10")
-    assert stored(page)["exams"][-1]["correct"] == 10
+    expect(page.locator(".result-stats > div").nth(0)).to_contain_text(f"{FIRST_TICKET_SIZE} / {FIRST_TICKET_SIZE}")
+    assert stored(page)["exams"][-1]["correct"] == FIRST_TICKET_SIZE
     assert stored(page)["exams"][-1]["allowedErrors"] == 0
     navigate(page, "history")
     expect(page.locator(".history-item")).to_have_count(1)
-    expect(page.locator(".history-score")).to_contain_text("10 / 10")
+    expect(page.locator(".history-score")).to_contain_text(f"{FIRST_TICKET_SIZE} / {FIRST_TICKET_SIZE}")
     expect(page.locator(".history-score")).to_contain_text("Экзамен сдан")
     print("PASS exam navigation, hidden feedback, deadline persistence, grading, and history")
 
     navigate(page, "home")
     action(page, "mode", '[data-mode="exam"]').click()
-    page.locator('[data-setting="ticketId"]').select_option("1")
+    page.locator('[data-setting="ticketId"]').select_option(FIRST_TICKET_ID)
     page.locator('[data-setting="minutes"]').select_option("5")
     page.locator('[data-setting="allowedErrors"]').select_option("0")
     action(page, "start").click()
@@ -170,9 +353,9 @@ def desktop_flow(browser, base_url, errors):
     }""", STORAGE_KEY)
     page.reload()
     expect(page.locator(".results h1")).to_have_text("Ещё немного практики.")
-    expect(page.locator(".result-stats > div").nth(0)).to_contain_text("1 / 10")
-    expect(page.locator(".result-stats > div").nth(1)).to_contain_text("пропущено: 9")
-    expect(page.locator(".review-question")).to_have_count(9)
+    expect(page.locator(".result-stats > div").nth(0)).to_contain_text(f"1 / {FIRST_TICKET_SIZE}")
+    expect(page.locator(".result-stats > div").nth(1)).to_contain_text(f"пропущено: {FIRST_TICKET_SIZE - 1}")
+    expect(page.locator(".review-question")).to_have_count(FIRST_TICKET_SIZE - 1)
     expired = stored(page)
     assert len(expired["exams"]) == 2
     assert expired["exams"][-1]["duration"] == 300000
@@ -198,9 +381,9 @@ def mobile_flow(browser, base_url, errors):
     page.set_viewport_size({"width": 390, "height": 844})
     page.screenshot(path="/tmp/boo-mobile.png", full_page=True)
     navigate(page, "tickets")
-    expect(page.locator(".ticket-card")).to_have_count(20)
+    expect(page.locator(".ticket-card")).to_have_count(len(DATA["tickets"]))
     no_overflow(page, "mobile tickets")
-    action(page, "ticket-learn", '[data-ticket="1"]').click()
+    action(page, "ticket-learn", f'[data-ticket="{FIRST_TICKET_ID}"]').click()
     choose_answer(page, FIRST, correct=False)
     action(page, "check").click()
     expect(page.locator(".feedback.negative")).to_be_visible()
@@ -228,11 +411,11 @@ def failed_load_flow(browser, base_url):
     page = context.new_page()
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
-    page.route("**/questions.json", lambda route: route.fulfill(status=503, body="Temporarily unavailable"))
+    page.route("**/questions.json*", lambda route: route.fulfill(status=503, body="Temporarily unavailable"))
     page.goto(base_url)
     expect(page.locator(".error-state h1")).to_have_text("Не удалось открыть тренажёр")
     expect(page.locator(".error-state")).to_contain_text("503")
-    page.unroute("**/questions.json")
+    page.unroute("**/questions.json*")
     page.locator("#retry").click()
     wait_home(page)
     assert not errors, f"Uncaught error during failed-load recovery: {errors}"
@@ -251,6 +434,9 @@ def main():
         desktop_flow(browser, args.base_url, errors)
         mobile_flow(browser, args.base_url, errors)
         failed_load_flow(browser, args.base_url)
+        deduplicated_learning_flow(browser, args.base_url, errors)
+        incomplete_ticket_flow(browser, args.base_url, errors)
+        migration_flow(browser, args.base_url, errors)
         browser.close()
         assert not errors, f"Browser errors: {errors}"
     print("Browser smoke passed; screenshots: /tmp/boo-desktop.png, /tmp/boo-mobile.png")

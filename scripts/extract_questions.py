@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract the ticket bank and its explicit answer keys from the source DOCX.
+"""Extract unique questions and their explicit answer keys from the source DOCX.
 
 Only the Python standard library is required. The original document is never
 modified. Unexpected document structure fails before the JSON is replaced.
@@ -33,6 +33,19 @@ class ExtractionError(ValueError):
 def normalize(text: str) -> str:
     """Remove Word layout whitespace without changing words or punctuation."""
     return " ".join(text.split())
+
+
+def question_signature(question: dict) -> tuple:
+    """Match the full question while preserving different rules and options.
+
+    Ignore layout whitespace, letter case and a single trailing question mark
+    in the stem. All other punctuation, option text and option order matter.
+    The answer is checked separately so contradictory keys cannot be hidden.
+    """
+    stem = normalize(question["text"]).casefold().removesuffix("?").rstrip()
+    options = tuple((option["id"], normalize(option["text"]).casefold())
+                    for option in question["options"])
+    return stem, options
 
 
 def paragraph_text(paragraph: ET.Element) -> str:
@@ -170,13 +183,64 @@ def parse_document(
     return {"source": source_name, "tickets": tickets}
 
 
+def deduplicate_bank(raw_bank: dict, *, questions_per_ticket: int = 10) -> dict:
+    """Keep the first occurrence, trace all sources, then build study tickets.
+
+    Original IDs remain stable for saved progress. The DOCX tickets are first
+    fully validated by parse_document; only then are repeated questions removed.
+    This function does not modify the raw bank or the source document.
+    """
+    if questions_per_ticket < 1:
+        raise ExtractionError("A study ticket must contain at least one question")
+    unique: dict[tuple, dict] = {}
+    original_count = 0
+    for ticket in raw_bank["tickets"]:
+        for original in ticket["questions"]:
+            original_count += 1
+            signature = question_signature(original)
+            question = unique.get(signature)
+            if question is None:
+                question = {**original, "aliases": [], "sourceRefs": []}
+                unique[signature] = question
+            elif question["correctOptionId"] != original["correctOptionId"]:
+                raise ExtractionError(
+                    f"Conflicting answer keys for questions {question['id']} and {original['id']}"
+                )
+            question["aliases"].append(original["id"])
+            question["sourceRefs"].append({
+                "id": original["id"],
+                "ticketId": ticket["id"],
+                "questionNumber": original["number"],
+            })
+
+    questions = list(unique.values())
+    tickets = []
+    for start in range(0, len(questions), questions_per_ticket):
+        group = questions[start:start + questions_per_ticket]
+        for number, question in enumerate(group, 1):
+            question["number"] = number
+        tickets.append({"id": len(tickets) + 1, "questions": group})
+    return {
+        "source": raw_bank["source"],
+        "metadata": {
+            "schemaVersion": 2,
+            "originalTicketCount": len(raw_bank["tickets"]),
+            "originalQuestionCount": original_count,
+            "uniqueQuestionCount": len(questions),
+            "duplicatesRemoved": original_count - len(questions),
+            "questionsPerTicket": questions_per_ticket,
+        },
+        "tickets": tickets,
+    }
+
+
 def extract_questions(source: Path) -> dict:
     try:
         with ZipFile(source) as archive:
             document_xml = archive.read("word/document.xml")
     except (BadZipFile, KeyError, OSError) as error:
         raise ExtractionError(f"Cannot read source DOCX: {error}") from error
-    return parse_document(document_xml, source.name)
+    return deduplicate_bank(parse_document(document_xml, source.name))
 
 
 def main() -> int:
@@ -202,7 +266,8 @@ def main() -> int:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
     count = sum(len(ticket["questions"]) for ticket in result["tickets"])
-    print(f"Extracted {len(result['tickets'])} tickets / {count} questions to {args.output}")
+    print(f"Extracted {len(result['tickets'])} study tickets / {count} unique questions "
+          f"({result['metadata']['duplicatesRemoved']} duplicates removed) to {args.output}")
     return 0
 
 
