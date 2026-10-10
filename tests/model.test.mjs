@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { emptyProgress, questionMap, restoreProgress, createSession, learningContinuation, recordAnswer, finishSession, resultFor, statsFor } from '../public/model.js';
+import { emptyProgress, questionMap, restoreProgress, createSession, learningContinuation, recordAnswer, finishSession, resultFor, statsFor, toggleDifficult, syncDifficultSession, nextDifficultQuestion } from '../public/model.js';
 
 const data = JSON.parse(await readFile(new URL('../public/questions.json', import.meta.url), 'utf8'));
 const map = questionMap(data.tickets);
@@ -528,4 +528,228 @@ test('an old unchecked all-bank session excludes its 60 studied questions throug
   assert.equal(restored.modes.learn.session.startedAt, 1000);
   assert.equal(statsFor(restored, map.size, 'learn').studied, 60);
   assert.ok(restored.modes.learn.session.questionIds.every(id => !restored.modes.learn.answers[id]));
+});
+
+test('existing v3 progress without difficult questions retains all 60 studied questions', () => {
+  const progress = emptyProgress();
+  for (const question of [...map.values()].slice(0, 60)) recordAnswer(progress, question, question.correctOptionId);
+  delete progress.difficult;
+  delete progress.modes.difficult;
+  const restored = restoreProgress(progress, map);
+  assert.deepEqual(restored.difficult, []);
+  assert.deepEqual(restored.modes.difficult, { answers: {}, session: null, settings: { ticketId: 0 } });
+  assert.equal(statsFor(restored, map.size, 'learn').studied, 60);
+  assert.equal(learningContinuation(data.tickets, restored).questionIds.length, 56);
+});
+
+test('difficult bookmarks restore canonical aliases once and keep reviewed feedback after reload', () => {
+  const repeated = [...map.values()].find(question => question.aliases.length > 1);
+  const [a, b] = repeated.aliases;
+  const progress = emptyProgress();
+  progress.selectedMode = 'difficult';
+  progress.difficult = [a, b, 'missing'];
+  progress.modes.difficult.answers = { [a]: { attempts: 2, correct: 1 }, [b]: { attempts: 1, correct: 1 } };
+  progress.modes.difficult.session = {
+    mode: 'difficult', status: 'active', questionIds: [a, b], index: 1,
+    startedAt: 1000, deadline: null, allowedErrors: 1, ticketId: null, bankVersion: 2,
+    responses: { [b]: repeated.correctOptionId }, checked: [b], round: 4,
+  };
+  const restored = restoreProgress(progress, map);
+  assert.equal(restored.selectedMode, 'difficult');
+  assert.deepEqual(restored.difficult, [repeated.id]);
+  assert.deepEqual(restored.modes.difficult.answers, { [repeated.id]: { attempts: 3, correct: 2 } });
+  assert.deepEqual(restored.modes.difficult.session.questionIds, [repeated.id]);
+  assert.deepEqual(restored.modes.difficult.session.checked, [repeated.id]);
+  assert.deepEqual(restored.modes.difficult.session.responses, { [repeated.id]: repeated.correctOptionId });
+  assert.equal(restored.modes.difficult.session.index, 0);
+  assert.equal(restored.modes.difficult.session.round, 4);
+  assert.equal(restored.modes.difficult.session.status, 'active');
+  assert.deepEqual(restoreProgress(JSON.parse(JSON.stringify(restored)), map), restored);
+});
+
+test('marking and unmarking difficult questions does not alter mistakes or any mode progress', () => {
+  const progress = emptyProgress();
+  const wrong = first.options.find(option => option.id !== first.correctOptionId).id;
+  recordAnswer(progress, first, wrong, 'learn');
+  progress.modes.mistakes.session = createSession(data.tickets, 'mistakes', {}, progress, 1000);
+  const before = structuredClone(progress);
+  assert.equal(toggleDifficult(progress, first.id), true);
+  assert.deepEqual(progress.difficult, [first.id]);
+  assert.deepEqual(progress.mistakes, before.mistakes);
+  assert.deepEqual(progress.modes, before.modes);
+  assert.equal(toggleDifficult(progress, first.id), false);
+  assert.deepEqual(progress, before);
+});
+
+test('difficult practice keeps bookmarks for right and wrong answers and updates only its own statistics', () => {
+  const progress = emptyProgress();
+  const wrong = first.options.find(option => option.id !== first.correctOptionId).id;
+  recordAnswer(progress, first, wrong, 'learn');
+  toggleDifficult(progress, first.id);
+  const learning = structuredClone(progress.modes.learn);
+  assert.equal(recordAnswer(progress, first, wrong, 'difficult'), false);
+  assert.deepEqual(progress.mistakes, [first.id]);
+  assert.deepEqual(progress.difficult, [first.id]);
+  assert.equal(recordAnswer(progress, first, first.correctOptionId, 'difficult'), true);
+  assert.deepEqual(progress.mistakes, []);
+  assert.deepEqual(progress.difficult, [first.id]);
+  assert.deepEqual(progress.modes.learn, learning);
+  assert.deepEqual(statsFor(progress, map.size, 'difficult'), { studied: 1, total: 116, attempts: 2, accuracy: 50, mistakes: 0 });
+  toggleDifficult(progress, first.id);
+  assert.equal(statsFor(progress, map.size, 'difficult').attempts, 2);
+});
+
+test('difficult sessions select only bookmarked questions in the chosen ticket', () => {
+  const progress = emptyProgress();
+  assert.equal(createSession(data.tickets, 'difficult', {}, progress), null);
+  const another = data.tickets[1].questions[0];
+  progress.difficult = [first.id, another.id];
+  const all = createSession(data.tickets, 'difficult', { ticketId: 0 }, progress, 1000);
+  assert.deepEqual(all.questionIds, [first.id, another.id]);
+  assert.equal(all.ticketId, null);
+  assert.equal(all.round, 1);
+  assert.equal(all.deadline, null);
+  assert.deepEqual(createSession(data.tickets, 'difficult', { ticketId: 1 }, progress).questionIds, [first.id]);
+  assert.equal(createSession(data.tickets, 'difficult', { ticketId: 3 }, progress), null);
+});
+
+test('difficult-session reload reconciles removed bookmarks without changing other saved modes', () => {
+  const progress = emptyProgress();
+  const [one, two, three] = data.tickets[0].questions;
+  progress.difficult = [one.id, two.id, three.id];
+  progress.modes.difficult.settings.ticketId = 1;
+  progress.modes.difficult.session = createSession(data.tickets, 'difficult', { ticketId: 1 }, progress, 1000);
+  progress.modes.difficult.session.index = 2;
+  progress.modes.difficult.session.responses[one.id] = one.correctOptionId;
+  progress.modes.difficult.session.checked = [one.id];
+  recordAnswer(progress, one, one.correctOptionId, 'difficult');
+  progress.mistakes = [three.id];
+  progress.modes.learn.session = createSession(data.tickets, 'learn', { ticketId: 2 }, progress, 2000);
+  progress.modes.exam.session = createSession(data.tickets, 'exam', { ticketId: 3, minutes: 5 }, progress, 3000);
+  progress.modes.mistakes.session = createSession(data.tickets, 'mistakes', {}, progress, 4000);
+  toggleDifficult(progress, three.id);
+  const restored = restoreProgress(JSON.parse(JSON.stringify(progress)), map);
+  assert.deepEqual(restored.difficult, [one.id, two.id]);
+  assert.deepEqual(restored.modes.difficult.settings, { ticketId: 1 });
+  assert.deepEqual(restored.modes.difficult.answers, progress.modes.difficult.answers);
+  assert.deepEqual(restored.modes.difficult.session.questionIds, [one.id, two.id]);
+  assert.equal(restored.modes.difficult.session.index, 1);
+  assert.equal(restored.modes.difficult.session.round, 1);
+  assert.deepEqual(restored.modes.difficult.session.checked, [one.id]);
+  assert.deepEqual(restored.modes.difficult.session.responses, { [one.id]: one.correctOptionId });
+  assert.deepEqual(restored.mistakes, [three.id]);
+  for (const mode of ['learn', 'exam', 'mistakes']) assert.deepEqual(restored.modes[mode], progress.modes[mode]);
+  restored.difficult = [];
+  assert.equal(restoreProgress(restored, map).modes.difficult.session, null);
+});
+
+test('difficult practice repeats checked questions indefinitely while statistics count every round', () => {
+  const progress = emptyProgress();
+  progress.difficult = data.tickets[0].questions.slice(0, 2).map(question => question.id);
+  progress.modes.difficult.session = createSession(data.tickets, 'difficult', {}, progress, 1000);
+  const session = progress.modes.difficult.session;
+  for (let round = 1; round <= 3; round++) {
+    assert.equal(session.round, round);
+    for (let index = 0; index < 2; index++) {
+      const question = map.get(session.questionIds[session.index]);
+      assert.equal(session.index, index);
+      session.responses[question.id] = question.correctOptionId;
+      recordAnswer(progress, question, question.correctOptionId, 'difficult');
+      session.checked.push(question.id);
+      assert.equal(nextDifficultQuestion(progress, map), session);
+    }
+    assert.equal(session.status, 'active');
+    assert.equal(session.index, 0);
+    assert.deepEqual(session.checked, []);
+    assert.deepEqual(session.responses, {});
+    assert.equal(session.round, round + 1);
+    assert.equal(progress.difficult.length, 2);
+    assert.equal(statsFor(progress, map.size, 'difficult').attempts, round * 2);
+  }
+  assert.equal(progress.exams.length, 0);
+  assert.equal(statsFor(progress, map.size, 'learn').attempts, 0);
+});
+
+test('a single difficult question starts a fresh attempt only on next, not on reload', () => {
+  const progress = emptyProgress();
+  progress.difficult = [first.id];
+  progress.modes.difficult.session = createSession(data.tickets, 'difficult', {}, progress, 1000);
+  const session = progress.modes.difficult.session;
+  session.responses[first.id] = first.correctOptionId;
+  session.checked = [first.id];
+  recordAnswer(progress, first, first.correctOptionId, 'difficult');
+  session.round = -1;
+  const restored = restoreProgress(JSON.parse(JSON.stringify(progress)), map);
+  assert.equal(restored.modes.difficult.session.round, 1);
+  assert.deepEqual(restored.modes.difficult.session.checked, [first.id]);
+  assert.equal(restored.modes.difficult.session.responses[first.id], first.correctOptionId);
+  nextDifficultQuestion(restored, map);
+  assert.equal(restored.modes.difficult.session.round, 2);
+  assert.equal(restored.modes.difficult.session.index, 0);
+  assert.deepEqual(restored.modes.difficult.session.checked, []);
+  assert.deepEqual(restored.modes.difficult.session.responses, {});
+  assert.deepEqual(restored.difficult, [first.id]);
+  assert.equal(statsFor(restored, map.size, 'difficult').attempts, 1);
+});
+
+test('editing a difficult collection preserves the current feedback and includes new eligible questions', () => {
+  const progress = emptyProgress();
+  const [one, two, three] = data.tickets[0].questions;
+  const otherTicket = data.tickets[1].questions[0];
+  progress.difficult = [one.id, two.id];
+  progress.modes.difficult.settings.ticketId = 1;
+  progress.modes.difficult.session = createSession(data.tickets, 'difficult', { ticketId: 1 }, progress, 1000);
+  const session = progress.modes.difficult.session;
+  session.index = 1;
+  session.responses[two.id] = two.correctOptionId;
+  session.checked = [two.id];
+  session.round = 3;
+  toggleDifficult(progress, three.id);
+  toggleDifficult(progress, otherTicket.id);
+  syncDifficultSession(progress, map);
+  assert.deepEqual(session.questionIds, [one.id, two.id, three.id]);
+  assert.equal(session.index, 1);
+  assert.equal(session.responses[two.id], two.correctOptionId);
+  assert.deepEqual(session.checked, [two.id]);
+  assert.equal(session.round, 3);
+  toggleDifficult(progress, one.id);
+  syncDifficultSession(progress, map);
+  assert.deepEqual(session.questionIds, [two.id, three.id]);
+  assert.equal(session.index, 0);
+  assert.equal(session.responses[two.id], two.correctOptionId);
+  toggleDifficult(progress, two.id);
+  syncDifficultSession(progress, map);
+  assert.deepEqual(session.questionIds, [three.id]);
+  assert.equal(session.index, 0);
+  assert.deepEqual(session.checked, []);
+  assert.deepEqual(session.responses, {});
+  assert.equal(session.round, 3);
+  assert.deepEqual(progress.modes.difficult.settings, { ticketId: 1 });
+});
+
+test('removing a checked current difficult question restarts the completed circle, then emptying it closes only that session', () => {
+  const progress = emptyProgress();
+  const [one, two] = data.tickets[0].questions;
+  progress.difficult = [one.id, two.id];
+  progress.mistakes = [one.id];
+  for (const mode of ['learn', 'exam', 'mistakes']) progress.modes[mode].session = createSession(data.tickets, mode, options, progress, 1000);
+  const others = Object.fromEntries(['learn', 'exam', 'mistakes'].map(mode => [mode, structuredClone(progress.modes[mode])]));
+  progress.modes.difficult.session = createSession(data.tickets, 'difficult', {}, progress, 1000);
+  const session = progress.modes.difficult.session;
+  session.responses = { [one.id]: one.correctOptionId, [two.id]: two.correctOptionId };
+  session.checked = [one.id, two.id];
+  session.index = 1;
+  toggleDifficult(progress, two.id);
+  assert.equal(syncDifficultSession(progress, map), session);
+  assert.deepEqual(session.questionIds, [one.id]);
+  assert.equal(session.round, 2);
+  assert.equal(session.status, 'active');
+  assert.deepEqual(session.responses, {});
+  assert.deepEqual(session.checked, []);
+  toggleDifficult(progress, one.id);
+  assert.equal(syncDifficultSession(progress, map), null);
+  assert.equal(progress.modes.difficult.session, null);
+  assert.deepEqual(progress.difficult, []);
+  assert.deepEqual(progress.mistakes, [one.id]);
+  for (const mode of ['learn', 'exam', 'mistakes']) assert.deepEqual(progress.modes[mode], others[mode]);
 });

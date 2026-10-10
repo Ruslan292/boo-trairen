@@ -1,5 +1,5 @@
 export const STORAGE_KEY = 'boo-trainer:v1';
-const MODES = ['learn', 'exam', 'mistakes'];
+const MODES = ['learn', 'exam', 'mistakes', 'difficult'];
 
 export function emptyProgress() {
   return {
@@ -8,8 +8,9 @@ export function emptyProgress() {
       learn: { answers: {}, session: null, settings: { ticketId: 0 } },
       exam: { answers: {}, session: null, settings: { ticketId: 0, minutes: 10, allowedErrors: 1 } },
       mistakes: { answers: {}, session: null, settings: { ticketId: 0 } },
+      difficult: { answers: {}, session: null, settings: { ticketId: 0 } },
     },
-    mistakes: [], exams: [],
+    mistakes: [], difficult: [], exams: [],
   };
 }
 
@@ -43,6 +44,7 @@ export function restoreProgress(raw, questions) {
   // the original data cannot reliably tell which mode produced an attempt.
   if (raw.version < 3) progress.modes.learn.answers = restoreAnswers(raw.answers);
   progress.mistakes = [...new Set(Array.isArray(raw.mistakes) ? raw.mistakes.map(canonicalId).filter(Boolean) : [])];
+  progress.difficult = [...new Set(Array.isArray(raw.difficult) ? raw.difficult.map(canonicalId).filter(Boolean) : [])];
   progress.exams = Array.isArray(raw.exams) ? raw.exams.filter(exam => Number.isFinite(exam?.finishedAt) && Number.isInteger(exam.total) && exam.total > 0 && Number.isInteger(exam.correct) && exam.correct >= 0 && exam.correct <= exam.total && Number.isInteger(exam.allowedErrors) && exam.allowedErrors >= 0).slice(-50).map(exam => ({ ...exam, bankVersion: [1, 2].includes(exam.bankVersion) ? exam.bankVersion : bankVersion })) : [];
 
   const restoreSession = (session, mode) => {
@@ -63,12 +65,13 @@ export function restoreProgress(raw, questions) {
     const currentId = canonicalId(session.questionIds[session.index]);
     let index = questionIds.indexOf(currentId);
     let status = session.status;
-    if (status === 'active' && mode !== 'exam' && checked.has(currentId) && !sourceChecked.has(session.questionIds[session.index])) {
+    if (status === 'active' && mode !== 'exam' && mode !== 'difficult' && checked.has(currentId) && !sourceChecked.has(session.questionIds[session.index])) {
       const nextId = session.questionIds.slice(session.index).map(canonicalId).find(id => !checked.has(id)) || questionIds.find(id => !checked.has(id));
       if (nextId) index = questionIds.indexOf(nextId);
       else status = 'finished';
     }
     const restored = { ...session, questionIds, index, responses, checked: [...checked], status, bankVersion: [1, 2].includes(session.bankVersion) ? session.bankVersion : bankVersion };
+    if (mode === 'difficult') restored.round = Number.isInteger(session.round) && session.round >= 1 ? session.round : 1;
     if (status === 'finished' && session.status !== 'finished') restored.finishedAt = Date.now();
     return restored;
   };
@@ -93,6 +96,7 @@ export function restoreProgress(raw, questions) {
     progress.selectedMode = raw.session.mode;
     progress.modes[raw.session.mode].session = restoreSession(raw.session, raw.session.mode);
   }
+  syncDifficultSession(progress, questions);
   return progress;
 }
 
@@ -102,6 +106,7 @@ export function createSession(tickets, mode, settings, progress, now = Date.now(
   if (mode === 'exam' && !settings.ticketId) selected = [tickets[Math.floor(random() * tickets.length)]];
   let questions = selected.flatMap(ticket => ticket.questions);
   if (mode === 'mistakes') questions = questions.filter(question => progress.mistakes.includes(question.id));
+  if (mode === 'difficult') questions = questions.filter(question => progress.difficult.includes(question.id));
   if (mode === 'learn' && settings.remainingOnly) questions = questions.filter(question => !progress.modes.learn.answers[question.id]);
   if (!questions.length) return null;
   return {
@@ -111,7 +116,57 @@ export function createSession(tickets, mode, settings, progress, now = Date.now(
     deadline: mode === 'exam' ? now + Number(settings.minutes || 10) * 60_000 : null,
     allowedErrors: Number(settings.allowedErrors ?? 1), status: 'active', bankVersion: 2,
     ...(mode === 'learn' && settings.repeat === true ? { repeat: true } : {}),
+    ...(mode === 'difficult' ? { round: 1 } : {}),
   };
+}
+
+export function toggleDifficult(progress, questionId) {
+  const marked = progress.difficult.includes(questionId);
+  progress.difficult = marked ? progress.difficult.filter(id => id !== questionId) : [...progress.difficult, questionId];
+  return !marked;
+}
+
+export function syncDifficultSession(progress, questions) {
+  const state = progress.modes.difficult;
+  const session = state.session;
+  if (!session || session.status !== 'active') return session;
+  const included = progress.difficult.filter(id => questions.has(id) && (!session.ticketId || questions.get(id).ticketId === session.ticketId));
+  const includedIds = new Set(included);
+  const previousIds = session.questionIds;
+  const currentId = previousIds[session.index];
+  session.questionIds = [...previousIds.filter(id => includedIds.has(id)), ...included.filter(id => !previousIds.includes(id))];
+  if (!session.questionIds.length) {
+    state.session = null;
+    return null;
+  }
+  session.responses = Object.fromEntries(Object.entries(session.responses).filter(([id]) => includedIds.has(id)));
+  session.checked = session.checked.filter(id => includedIds.has(id));
+  const currentIndex = session.questionIds.indexOf(currentId);
+  if (currentIndex >= 0) session.index = currentIndex;
+  else {
+    const followingIds = [...previousIds.slice(session.index + 1), ...previousIds.slice(0, session.index), ...included];
+    const nextId = followingIds.find(id => includedIds.has(id) && !session.checked.includes(id));
+    if (nextId) session.index = session.questionIds.indexOf(nextId);
+    else restartDifficultRound(session);
+  }
+  return session;
+}
+
+function restartDifficultRound(session) {
+  session.index = 0;
+  session.responses = {};
+  session.checked = [];
+  session.round = (Number.isInteger(session.round) && session.round >= 1 ? session.round : 1) + 1;
+}
+
+export function nextDifficultQuestion(progress, questions) {
+  const session = syncDifficultSession(progress, questions);
+  if (!session || session.status !== 'active') return session;
+  const followingIds = [...session.questionIds.slice(session.index + 1), ...session.questionIds.slice(0, session.index + 1)];
+  const nextId = followingIds.find(id => !session.checked.includes(id));
+  if (nextId) session.index = session.questionIds.indexOf(nextId);
+  else restartDifficultRound(session);
+  return session;
 }
 
 export function learningContinuation(tickets, progress, ticketId = 0, now = Date.now()) {
